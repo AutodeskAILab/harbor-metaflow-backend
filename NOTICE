@@ -1,0 +1,7 @@
+harbor-metaflow-backend
+Copyright 2026 Autodesk, Inc.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It is a plugin for Harbor (https://github.com/harbor-framework/harbor),
+which is licensed under the Apache License, Version 2.0.
