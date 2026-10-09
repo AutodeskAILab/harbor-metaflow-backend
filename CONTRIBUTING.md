@@ -40,7 +40,16 @@ standard trial directory. When you change behaviour, add or update a test there.
 - Update `README.md` when you add or change an option, and add an entry under
   "Unreleased" in `CHANGELOG.md`.
 - Do not commit credentials, account ids, bucket or queue names, or other
-  deployment details. Examples should use placeholders such as `<bucket>`.
+  deployment details. Examples should use placeholders such as `<bucket>`. Before
+  pushing, check the tree with:
+
+  ```bash
+  git grep -nIE '[0-9]{12}|arn:aws:|dkr\.ecr\.|s3://[a-z0-9]|amazonaws\.com' \
+      -- . ':!CONTRIBUTING.md' | grep -vE '123456789012|s3://(bucket|example-bucket|b)\b'
+  ```
+
+  It should print nothing (`123456789012` is AWS's documentation placeholder, and
+  `s3://bucket`, `s3://example-bucket` and `s3://b` are the tests' placeholders).
 - By contributing, you agree that your contributions are licensed under the
   Apache License, Version 2.0.
 

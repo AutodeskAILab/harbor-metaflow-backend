@@ -35,6 +35,7 @@ import shutil
 import tempfile
 import uuid
 from collections.abc import Callable, Coroutine
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -73,9 +74,13 @@ HARBOR_SKIPS_REMOTE_ENV_PREFLIGHT = hasattr(
 HARBOR_CLOSES_BACKENDS = hasattr(BaseTrialBackend, "aclose")
 
 ENV_PREFIX = "HARBOR_METAFLOW_"
+#: Copied into the Batch jobs whenever set on the submitting host.
+FORWARDED_ENV = ("HARBOR_TELEMETRY",)
 HOOK_BRANCH = "git+https://github.com/AutodeskAILab/harbor@feat/backend-plugins"
 DEFAULT_SHARD_SIZE = 8
 DEFAULT_POLL_INTERVAL_SEC = 30.0
+#: After the last trial came back, how long the flow gets to finish its join/end.
+DEFAULT_FLOW_EXIT_GRACE_SEC = 120.0
 
 
 class TrialBackendUnavailable(RuntimeError):
@@ -166,6 +171,14 @@ class MetaflowBatchBackend(BaseTrialBackend):
         keep_run_root: bool | str | None = None,
         python: str | None = None,
         metaflow_args: str | list[str] | None = None,
+        job_user: str | None = None,
+        bootstrap: str | None = None,
+        bootstrap_files: str | list[str] | None = None,
+        bootstrap_timeout_sec: int | str | None = None,
+        prepare: str | None = None,
+        flow_exit_grace_sec: float | str | None = None,
+        code_paths: str | list[str] | None = None,
+        package_suffixes: str | list[str] | None = None,
         launcher: Any = None,
         store_factory: Callable[[str], RunStore] | None = None,
         terminate: Callable[[list[str], str], None] | None = None,
@@ -187,6 +200,10 @@ class MetaflowBatchBackend(BaseTrialBackend):
         self.poll_interval_sec = float(
             _opt("poll_interval_sec", poll_interval_sec, DEFAULT_POLL_INTERVAL_SEC)
         )
+        grace = _opt("flow_exit_grace_sec", flow_exit_grace_sec)
+        self.flow_exit_grace_sec = float(
+            DEFAULT_FLOW_EXIT_GRACE_SEC if grace is None else grace
+        )
         self.stage_agent_kwargs = _as_list(
             _opt("stage_agent_kwargs", stage_agent_kwargs)
         )
@@ -198,6 +215,39 @@ class MetaflowBatchBackend(BaseTrialBackend):
         missing = [n for n in env_names if n not in os.environ]
         if missing:
             raise ValueError(f"env_vars names unset variables: {', '.join(missing)}")
+        env_names += [
+            n for n in FORWARDED_ENV if n in os.environ and n not in env_names
+        ]
+
+        bootstrap_path = _opt("bootstrap", bootstrap)
+        self.bootstrap = (
+            Path(bootstrap_path).expanduser().resolve() if bootstrap_path else None
+        )
+        self.bootstrap_files = [
+            Path(f).expanduser().resolve()
+            for f in _as_list(_opt("bootstrap_files", bootstrap_files))
+        ]
+        if self.bootstrap_files and self.bootstrap is None:
+            raise ValueError("bootstrap_files needs a bootstrap script")
+        staged = [self.bootstrap, *self.bootstrap_files] if self.bootstrap else []
+        for path in staged:
+            if not path.is_file():
+                raise ValueError(f"bootstrap file {path} does not exist")
+        names = [path.name for path in staged]
+        if len(set(names)) != len(names) or "env" in names:
+            raise ValueError(
+                "bootstrap and bootstrap_files need distinct file names (not 'env')"
+            )
+        self.bootstrap_timeout_sec = int(
+            _opt("bootstrap_timeout_sec", bootstrap_timeout_sec, 0)
+        )
+        self.prepare = _opt("prepare", prepare)
+        if self.prepare and ":" not in str(self.prepare):
+            raise ValueError(f"prepare must be 'module:function', got {self.prepare!r}")
+        self.code_paths = _as_list(_opt("code_paths", code_paths))
+        for raw in self.code_paths:
+            if not Path(raw).expanduser().exists():
+                raise ValueError(f"code_paths: {raw} does not exist")
         default_work_dir = (
             str(Path(tempfile.gettempdir()) / "harbor-metaflow-work")
             if self.local
@@ -218,6 +268,7 @@ class MetaflowBatchBackend(BaseTrialBackend):
             privileged=_as_bool(_opt("privileged", privileged, False)),
             env={name: os.environ[name] for name in env_names},
             secrets=_as_list(_opt("secrets", secrets)),
+            job_user=_opt("job_user", job_user) or None,
         )
         if launcher is None:
             if not self.local and not self.settings.image:
@@ -232,6 +283,8 @@ class MetaflowBatchBackend(BaseTrialBackend):
                 python=_opt("python", python),
                 max_workers=int(_opt("max_workers", max_workers, 16)),
                 extra_args=extra.split() if isinstance(extra, str) else extra,
+                code_paths=self.code_paths,
+                package_suffixes=_as_list(_opt("package_suffixes", package_suffixes)),
             )
         self.launcher = launcher
         self.store_factory = store_factory or open_store
@@ -297,6 +350,19 @@ class MetaflowBatchBackend(BaseTrialBackend):
             ],
             "trials": trials,
         }
+        if self.bootstrap is not None:
+            keys = []
+            for path in [self.bootstrap, *self.bootstrap_files]:
+                key = f"bootstrap/{path.name}"
+                store.upload_file(path, key)
+                keys.append(key)
+            manifest["bootstrap"] = {
+                "script": keys[0],
+                "files": keys[1:],
+                "timeout_sec": self.bootstrap_timeout_sec,
+            }
+        if self.prepare:
+            manifest["prepare"] = str(self.prepare)
         store.put_text(W.MANIFEST_KEY, json.dumps(manifest))
         return manifest
 
@@ -407,6 +473,7 @@ class _BatchRun:
                         )
                     break
                 await asyncio.sleep(backend.poll_interval_sec)
+            await self._await_flow_exit()
         except asyncio.CancelledError:
             await asyncio.shield(asyncio.to_thread(self._stop, "cancelled by harbor"))
             raise
@@ -416,6 +483,15 @@ class _BatchRun:
                 self._fail(name, exc)
         finally:
             self._cleanup_flow()
+
+    async def _await_flow_exit(self) -> None:
+        """Every trial is back; give the flow its join/end, then stop it."""
+        deadline = asyncio.get_running_loop().time() + self.backend.flow_exit_grace_sec
+        while self.flow.poll() is None:
+            if asyncio.get_running_loop().time() >= deadline:
+                await asyncio.to_thread(self.flow.stop)
+                return
+            await asyncio.sleep(min(1.0, self.backend.poll_interval_sec))
 
     async def _collect(self) -> None:
         from harbor.trial.hooks import TrialEvent
@@ -458,6 +534,14 @@ class _BatchRun:
         return event
 
     async def close(self, delete: bool) -> None:
+        if (
+            self.driver is not None
+            and not self.driver.done()
+            and self.finished == set(self.configs)
+        ):
+            # Only waiting for the flow to exit (bounded by flow_exit_grace_sec).
+            with contextlib.suppress(Exception):
+                await self.driver
         await self._cancel_driver()
         complete = (
             self.driver is not None
@@ -474,16 +558,38 @@ class _BatchRun:
         if future is not None and not future.done():
             future.set_exception(exc)
 
+    def _note(self, message: str) -> None:
+        """Append a line to this run's Metaflow log in the job dir (best effort)."""
+        log_path = getattr(self.flow, "log_path", None)
+        if log_path is None:
+            return
+        stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        with contextlib.suppress(OSError), open(log_path, "a") as log:
+            log.write(f"{stamp} [harbor-metaflow-backend] {message}\n")
+
     def _stop(self, reason: str) -> None:
+        """Stop the flow, then terminate every Batch job a worker recorded."""
+        self._note(f"stopping the flow ({reason})")
         if self.flow is not None:
-            self.flow.stop()
-        job_ids = []
-        for key in self.store.list("batch"):
-            text = self.store.get_text(key)
-            if text:
-                job_ids.append(json.loads(text)["job_id"])
-        if job_ids:
-            self.backend.terminate(job_ids, reason)
+            try:
+                self.flow.stop()
+            except Exception:
+                logger.exception(
+                    "stopping the Metaflow flow of %s failed", self.run_uri
+                )
+        try:
+            job_ids = []
+            for key in self.store.list("batch"):
+                text = self.store.get_text(key)
+                if text:
+                    job_ids.append(json.loads(text)["job_id"])
+            if job_ids:
+                self._note(f"terminating Batch jobs {', '.join(job_ids)}")
+                self.backend.terminate(job_ids, reason)
+                self._note("terminate requested")
+        except Exception as exc:
+            self._note(f"terminating Batch jobs failed: {exc!r}")
+            logger.exception("terminating the Batch jobs of %s failed", self.run_uri)
 
     def _cleanup_flow(self) -> None:
         cleanup = getattr(self.flow, "cleanup", None)

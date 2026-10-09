@@ -4,10 +4,13 @@ Runs inside the generated Metaflow flow, normally in an AWS Batch container. It
 needs only what stock Harbor has (``TrialQueue``): the trial backend hook is used
 on the submitting side, not here.
 
-    read manifest -> download task dirs  -> environment preflight
-                     rebind paths to this     -> TrialQueue(n_concurrent, retry)
-                     host                        START hook: events/<trial>/start.json
-                                                 result:     results/<trial>/ + .done
+    read manifest -> host preparation -> download task dirs -> environment preflight
+                     (bootstrap script,   rebind paths to this  -> TrialQueue(n, retry)
+                      prepare callable)   host                     START: events/
+                                                                   result: results/
+
+Host preparation runs before anything imports Harbor, so a bootstrap script can
+install Harbor and the Docker CLI on an image that has neither.
 
 Each trial's final directory is uploaded as soon as its coroutine returns (after
 the queue's retries), so the submitting side can copy it back while the shard is
@@ -17,9 +20,13 @@ still running.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 import shutil
+import site
+import subprocess
+import sys
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -55,6 +62,20 @@ def batch_job_key(shard: int) -> str:
     return f"batch/{int(shard)}.json"
 
 
+#: Environment variables a bootstrap script sees (see :func:`run_bootstrap`).
+BOOTSTRAP_ENV_FILE = "HARBOR_METAFLOW_ENV_FILE"
+BOOTSTRAP_DIR = "HARBOR_METAFLOW_BOOTSTRAP_DIR"
+BOOTSTRAP_WORK_DIR = "HARBOR_METAFLOW_WORK_DIR"
+BOOTSTRAP_RUN_URI = "HARBOR_METAFLOW_RUN_URI"
+BOOTSTRAP_PYTHON = "HARBOR_METAFLOW_PYTHON"
+#: Lines of bootstrap output kept in the error reported for each trial.
+BOOTSTRAP_TAIL_LINES = 60
+
+
+class HostPreparationError(RuntimeError):
+    """The bootstrap script or the prepare callable failed on the trial host."""
+
+
 def load_manifest(store: RunStore) -> dict:
     text = store.get_text(MANIFEST_KEY)
     if text is None:
@@ -84,6 +105,125 @@ def localize_config(entry: dict, work_dir: Path, store: RunStore):
     return config
 
 
+def apply_env_file(path: Path, environ: dict | None = None) -> dict[str, str]:
+    """Load ``KEY=VALUE`` lines a bootstrap script wrote into this process.
+
+    Blank lines and ``#`` comments are skipped; values are taken literally, so the
+    script expands them itself::
+
+        echo "PATH=/opt/x/bin:$PATH" >> "$HARBOR_METAFLOW_ENV_FILE"
+
+    ``PYTHONPATH`` entries are also put on ``sys.path``.
+    """
+    environ = os.environ if environ is None else environ
+    applied: dict[str, str] = {}
+    if not path.is_file():
+        return applied
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise HostPreparationError(f"bad line in {path.name}: {line!r}")
+        environ[key] = value
+        applied[key] = value
+    for entry in reversed(applied.get("PYTHONPATH", "").split(os.pathsep)):
+        if entry and entry not in sys.path:
+            sys.path.insert(0, entry)
+    return applied
+
+
+def _refresh_import_paths() -> None:
+    """Make packages a bootstrap just installed importable in this process."""
+    user_site = site.getusersitepackages()
+    if os.path.isdir(user_site) and user_site not in sys.path:
+        site.addsitedir(user_site)
+    importlib.invalidate_caches()
+
+
+def run_bootstrap(
+    store: RunStore, spec: dict, work_dir: Path, *, shell: str = "bash"
+) -> dict[str, str]:
+    """Run the staged bootstrap script on this host; returns the env it exported.
+
+    The script and ``bootstrap_files`` are downloaded to ``<work_dir>/bootstrap/``
+    and the script runs there with ``bash``. It sees ``HARBOR_METAFLOW_BOOTSTRAP_DIR``
+    (that dir), ``HARBOR_METAFLOW_WORK_DIR``, ``HARBOR_METAFLOW_RUN_URI``,
+    ``HARBOR_METAFLOW_PYTHON`` (the worker's interpreter, the one to ``pip install``
+    into) and ``HARBOR_METAFLOW_ENV_FILE``: ``KEY=VALUE`` lines appended to that
+    file are set in the worker (and so in every trial's subprocesses) when the script
+    exits 0.
+    """
+    bdir = work_dir / "bootstrap"
+    bdir.mkdir(parents=True, exist_ok=True)
+    keys = [spec["script"], *spec.get("files", [])]
+    for key in keys:
+        store.download_file(key, bdir / Path(key).name)
+    script = bdir / Path(spec["script"]).name
+    env_file = bdir / "env"
+    env_file.write_text("")
+    env = {
+        **os.environ,
+        BOOTSTRAP_ENV_FILE: str(env_file),
+        BOOTSTRAP_DIR: str(bdir),
+        BOOTSTRAP_WORK_DIR: str(work_dir),
+        BOOTSTRAP_RUN_URI: store.uri,
+        BOOTSTRAP_PYTHON: sys.executable,
+    }
+    timeout = spec.get("timeout_sec") or None
+    print(f"harbor-metaflow: running bootstrap {script.name}", flush=True)
+    try:
+        proc = subprocess.run(
+            [shell, str(script)],
+            cwd=bdir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or ""
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        sys.stdout.write(out)
+        raise HostPreparationError(
+            f"bootstrap {script.name} timed out after {timeout}s; last output:\n"
+            + "\n".join(out.splitlines()[-BOOTSTRAP_TAIL_LINES:])
+        ) from None
+    sys.stdout.write(proc.stdout)
+    sys.stdout.flush()
+    if proc.returncode != 0:
+        tail = "\n".join(proc.stdout.splitlines()[-BOOTSTRAP_TAIL_LINES:])
+        raise HostPreparationError(
+            f"bootstrap {script.name} exited {proc.returncode}; last output:\n{tail}"
+        )
+    applied = apply_env_file(env_file)
+    _refresh_import_paths()
+    return applied
+
+
+def run_prepare(import_path: str, work_dir: Path) -> None:
+    """Call ``module:function`` with this shard's work dir (in this process)."""
+    module_name, sep, attr = import_path.partition(":")
+    if not sep or not module_name or not attr:
+        raise ValueError(f"prepare must be 'module:function', got {import_path!r}")
+    func = importlib.import_module(module_name)
+    for part in attr.split("."):
+        func = getattr(func, part)
+    func(work_dir)
+
+
+def prepare_host(store: RunStore, manifest: dict, work_dir: Path) -> None:
+    """The manifest's bootstrap script, then its prepare callable, if any."""
+    if manifest.get("bootstrap"):
+        run_bootstrap(store, manifest["bootstrap"], work_dir)
+    if manifest.get("prepare"):
+        run_prepare(manifest["prepare"], work_dir)
+
+
 def environment_preflight(configs) -> None:
     """Harbor's environment preflight, once per distinct environment, on this host.
 
@@ -106,19 +246,19 @@ async def run_shard_async(
     shard: int,
     work_dir: str | Path,
     *,
+    prepare: Callable[[RunStore, dict, Path], None] | None = None,
     preflight: Callable[[list], None] | None = None,
     queue_factory: Any = None,
     cleanup: bool = False,
 ) -> dict:
     """Run every trial of ``shard``; returns ``{"done": [...], "error": [...]}``.
 
-    If the environment preflight fails, no trial runs and every trial of the shard
-    is reported as an error with the preflight's message. With ``cleanup``, the
-    shard's work dir is removed once its results are uploaded.
+    The host is prepared first (``prepare_host``: the manifest's bootstrap script and
+    prepare callable), before Harbor is imported. If that or the environment
+    preflight fails, no trial runs and every trial of the shard is reported as an
+    error with the message. With ``cleanup``, the shard's work dir is removed once
+    its results are uploaded.
     """
-    from harbor.models.job.config import RetryConfig
-    from harbor.trial.hooks import TrialEvent
-
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(store)
@@ -128,21 +268,31 @@ async def run_shard_async(
         store.put_text(batch_job_key(shard), json.dumps({"job_id": job_id}))
 
     summary: dict[str, list[str]] = {"done": [], "error": []}
+
+    def fail_all(what: str) -> dict:
+        message = f"{what} failed on the trial host:\n{traceback.format_exc()}"
+        print(message, file=sys.stderr, flush=True)
+        for name in names:
+            store.put_text(error_key(name), message)
+        summary["error"] = list(names)
+        return summary
+
     try:
+        try:
+            (prepare or prepare_host)(store, manifest, work_dir)
+        except (Exception, SystemExit):
+            return fail_all("host preparation")
+
+        from harbor.models.job.config import RetryConfig
+        from harbor.trial.hooks import TrialEvent
+
         configs = [
             localize_config(manifest["trials"][name], work_dir, store) for name in names
         ]
         try:
             (preflight or environment_preflight)(configs)
         except (Exception, SystemExit):  # Harbor preflights exit on failure
-            message = (
-                "environment preflight failed on the trial host:\n"
-                f"{traceback.format_exc()}"
-            )
-            for name in names:
-                store.put_text(error_key(name), message)
-            summary["error"] = list(names)
-            return summary
+            return fail_all("environment preflight")
 
         if queue_factory is None:
             from harbor.trial.queue import TrialQueue as queue_factory

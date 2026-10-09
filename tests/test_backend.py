@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import subprocess
 import sys
@@ -328,3 +329,98 @@ else:
     )
     assert "pluggable trial backends" in out.stdout
     assert "feat/backend-plugins" in out.stdout
+
+
+@needs_aclose
+@run_async
+async def test_flow_that_outlives_its_trials_is_waited_for_then_stopped(
+    tmp_path, fake_trials
+):
+    from harbor.job import Job
+
+    launcher = InProcessLauncher(tmp_path / "batch-host", linger=True)
+    backend = make_backend(tmp_path, launcher, flow_exit_grace_sec=0.05)
+    job = await Job.create(job_config(tmp_path), backend=backend)
+    result = await job.run()
+
+    assert result.stats.n_completed_trials == 3
+    flow = launcher.flows[0]
+    assert flow.stopped and flow.cleaned  # flow dir removed, no process left
+    assert backend.terminated == []  # nothing to terminate: every trial came back
+    assert not Path(launcher.starts[0]).exists()
+
+
+@needs_aclose
+@run_async
+async def test_flow_that_exits_on_its_own_is_cleaned_up_not_stopped(
+    tmp_path, fake_trials
+):
+    from harbor.job import Job
+
+    launcher = InProcessLauncher(tmp_path / "batch-host")
+    backend = make_backend(tmp_path, launcher)
+    job = await Job.create(job_config(tmp_path), backend=backend)
+    await job.run()
+
+    flow = launcher.flows[0]
+    assert flow.cleaned and not flow.stopped
+
+
+@needs_hook
+@run_async
+async def test_cancelling_the_job_terminates_batch_jobs_of_a_multi_trial_run(
+    tmp_path, fake_trials, monkeypatch
+):
+    """Ctrl-C cancels every trial coroutine of a run at once; each cancels the shared
+    driver while it is still stopping the flow. The Batch jobs must still be
+    terminated, and the stop is recorded in the run's Metaflow log."""
+    from harbor.job import Job
+
+    from conftest import FakeFlow
+
+    monkeypatch.setattr(FakeFlow, "stop_delay", 0.2)
+    launcher = InProcessLauncher(tmp_path / "batch-host", hang_with_job_id="job-7")
+    backend = make_backend(tmp_path, launcher)
+    job = await Job.create(job_config(tmp_path, n_attempts=3), backend=backend)
+    run = asyncio.create_task(job.run())
+    for _ in range(500):
+        if launcher.flows:
+            break
+        await asyncio.sleep(0.01)
+    assert launcher.flows, "flow never started"
+    await asyncio.sleep(0.05)
+
+    run.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await run
+
+    assert launcher.flows[0].stopped
+    assert backend.terminated == [(["job-7"], "cancelled by harbor")]
+    notes = launcher.flows[0].log_path.read_text()
+    assert "stopping the flow (cancelled by harbor)" in notes
+    assert "terminating Batch jobs job-7" in notes
+
+
+@needs_hook
+@run_async
+async def test_a_failing_terminate_is_logged_not_swallowed(
+    tmp_path, fake_trials, caplog
+):
+    launcher = InProcessLauncher(tmp_path / "batch-host", hang_with_job_id="job-8")
+    backend = make_backend(tmp_path, launcher)
+
+    def denied(ids, reason):
+        raise PermissionError("batch:TerminateJob denied")
+
+    backend.terminate = denied
+    task = asyncio.create_task(backend.submit_batch(planned_trial_configs(tmp_path))[0])
+    for _ in range(500):
+        if launcher.flows:
+            break
+        await asyncio.sleep(0.01)
+    launcher.flows[0].log_path.parent.mkdir(parents=True, exist_ok=True)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert "terminating the Batch jobs" in caplog.text
+    assert "TerminateJob denied" in launcher.flows[0].log_path.read_text()

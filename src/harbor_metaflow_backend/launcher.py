@@ -5,6 +5,11 @@ with the run's settings baked in as a literal. Metaflow re-imports the flow file
 inside every Batch container, so decorator arguments must not depend on the
 environment of the submitting process; a literal is identical on both sides.
 
+The flow file is written to a fresh directory together with a copy of this package
+and of any ``code_paths``. Metaflow ships that directory to the Batch jobs as the
+flow's code package and puts it on ``sys.path`` there, so the image does not need
+this package installed (it still needs Harbor, or a bootstrap that installs it).
+
     start (submitting host) -> run_shard (foreach shard; @batch) -> join -> end
 """
 
@@ -22,6 +27,7 @@ from pathlib import Path
 from string import Template
 
 FLOW_FILE_NAME = "harbor_trials_flow.py"
+PACKAGE_DIR = Path(__file__).resolve().parent
 
 #: SIGINT to the flow (Metaflow stops its tasks), then SIGTERM, then SIGKILL.
 STOP_GRACE_SEC = 60.0
@@ -44,6 +50,7 @@ class FlowSettings:
     env: dict[str, str] = field(default_factory=dict)
     secrets: list[str] = field(default_factory=list)
     cleanup_work_dir: bool = True
+    job_user: str | None = None
 
     def batch_kwargs(self) -> dict | None:
         """Arguments for Metaflow's ``@batch``, or ``None`` to run steps locally."""
@@ -76,6 +83,12 @@ import os
 from metaflow import FlowSpec, Parameter, current, step
 
 SETTINGS = json.loads($settings)
+
+if SETTINGS["batch"] is not None and SETTINGS["job_user"]:
+    # Job definitions get containerProperties.user (Metaflow's @batch has no option).
+    from harbor_metaflow_backend.jobdef import install_job_user
+
+    install_job_user(SETTINGS["job_user"])
 
 
 def _decorate(func):
@@ -170,6 +183,38 @@ class FlowProcess:
             shutil.rmtree(self.flow_dir, ignore_errors=True)
 
 
+def _ignore_caches(_dir: str, names: list[str]) -> set[str]:
+    skip = ("__pycache__", ".pytest_cache")
+    return {n for n in names if n in skip or n.endswith(".pyc")}
+
+
+def write_flow_dir(
+    flow_dir: Path, settings: FlowSettings, code_paths: list[str] | None = None
+) -> Path:
+    """Write the flow file, a copy of this package and the ``code_paths``.
+
+    Everything in ``flow_dir`` with one of Metaflow's package suffixes (``.py`` by
+    default) is shipped to the Batch jobs and importable there by its top-level name.
+    """
+    flow_dir.mkdir(parents=True, exist_ok=True)
+    taken = {FLOW_FILE_NAME, PACKAGE_DIR.name}
+    shutil.copytree(PACKAGE_DIR, flow_dir / PACKAGE_DIR.name, ignore=_ignore_caches)
+    for raw in code_paths or []:
+        src = Path(raw).expanduser().resolve()
+        if src.name in taken:
+            raise ValueError(f"code_paths: {src.name!r} is already in the flow dir")
+        taken.add(src.name)
+        if src.is_dir():
+            shutil.copytree(src, flow_dir / src.name, ignore=_ignore_caches)
+        elif src.is_file():
+            shutil.copy2(src, flow_dir / src.name)
+        else:
+            raise FileNotFoundError(f"code_paths: {raw} does not exist")
+    flow_file = flow_dir / FLOW_FILE_NAME
+    flow_file.write_text(render_flow(settings))
+    return flow_file
+
+
 class MetaflowLauncher:
     """Renders the flow into a temporary dir and runs it with Metaflow."""
 
@@ -179,17 +224,24 @@ class MetaflowLauncher:
         python: str | None = None,
         max_workers: int = 16,
         extra_args: list[str] | None = None,
+        code_paths: list[str] | None = None,
+        package_suffixes: list[str] | None = None,
     ):
         self.settings = settings
         self.python = python or sys.executable
         self.max_workers = int(max_workers)
         self.extra_args = list(extra_args or [])
+        self.code_paths = list(code_paths or [])
+        self.package_suffixes = list(package_suffixes or [])
 
     def command(self, flow_file: Path, run_uri: str, n_shards: int) -> list[str]:
+        top = ["--no-pylint"]
+        if self.package_suffixes:
+            top += ["--package-suffixes", ",".join(self.package_suffixes)]
         return [
             self.python,
             str(flow_file),
-            "--no-pylint",
+            *top,
             "run",
             "--run_uri",
             run_uri,
@@ -202,8 +254,11 @@ class MetaflowLauncher:
 
     def start(self, run_uri: str, n_shards: int, log_path: Path) -> FlowProcess:
         flow_dir = Path(tempfile.mkdtemp(prefix="harbor-metaflow-"))
-        flow_file = flow_dir / FLOW_FILE_NAME
-        flow_file.write_text(render_flow(self.settings))
+        try:
+            flow_file = write_flow_dir(flow_dir, self.settings, self.code_paths)
+        except BaseException:
+            shutil.rmtree(flow_dir, ignore_errors=True)
+            raise
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "ab") as log:
             proc = subprocess.Popen(

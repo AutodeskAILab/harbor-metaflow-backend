@@ -110,18 +110,29 @@ class FakeTrial:
 
 
 class FakeFlow:
-    def __init__(self, thread: threading.Thread | None, log_path: Path):
+    def __init__(
+        self, thread: threading.Thread | None, log_path: Path, linger: bool = False
+    ):
         self.thread = thread
         self.log_path = log_path
+        self.linger = linger
         self.stopped = False
         self.cleaned = False
 
     def poll(self):
-        if self.thread is None:
-            return None  # "runs on Batch" until stopped
+        if self.stopped:
+            return -2
+        if self.thread is None or self.linger:
+            return None  # "runs on Batch" (or hangs in join) until stopped
         return None if self.thread.is_alive() else 0
 
+    #: Seconds stop() blocks, like waiting for Metaflow to exit (real: ~1 s).
+    stop_delay = 0.0
+
     def stop(self, grace: float = 0) -> None:
+        import time
+
+        time.sleep(self.stop_delay)
         self.stopped = True
 
     def cleanup(self) -> None:
@@ -137,7 +148,9 @@ class InProcessLauncher:
         shards: list[int] | None = None,
         hang_with_job_id: str | None = None,
         preflight=None,
+        linger: bool = False,
     ):
+        self.linger = linger
         self.work_root = work_root
         self.only_shards = shards
         self.hang_with_job_id = hang_with_job_id
@@ -169,7 +182,7 @@ class InProcessLauncher:
 
             thread = threading.Thread(target=run_all, daemon=True)
             thread.start()
-            flow = FakeFlow(thread, log_path)
+            flow = FakeFlow(thread, log_path, linger=self.linger)
         self.flows.append(flow)
         return flow
 
@@ -239,3 +252,11 @@ def planned_trial_configs(tmp_path: Path, n_attempts: int = 1):
     config = job_config(tmp_path, n_attempts=n_attempts)
     task_configs = [TaskConfig(path=config.tasks[0].path)]
     return JobPlan.build_trial_configs(config, task_configs, job_id=uuid.uuid4())
+
+
+#: Work dirs ``record_prepare`` was called with (``prepare="conftest:record_prepare"``).
+PREPARED: list[Path] = []
+
+
+def record_prepare(work_dir: Path) -> None:
+    PREPARED.append(Path(work_dir))
